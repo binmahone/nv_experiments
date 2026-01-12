@@ -1,0 +1,6 @@
+JAR: /home/hongbin/experiments/20260108_pr13724_pipeline_benchmark/jars/rapids-4-spark_2.12-baseline-e95ea4c7d.jar
+Shuffle size: 6gb_shuffle
+Average time: 44928ms
+Min time: 44594ms
+Max time: 45316ms
+All runs: 44876, 45316, 44594ms

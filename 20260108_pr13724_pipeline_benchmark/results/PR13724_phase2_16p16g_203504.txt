@@ -1,0 +1,7 @@
+JAR: /home/hongbin/code/spark-rapids3-2/dist/target/rapids-4-spark_2.12-26.02.0-SNAPSHOT-cuda12.jar
+Config: 16 parallelism + 16GB shuffle
+Parallelism: 16
+Average time: 10754ms
+Min time: 10286ms
+Max time: 11121ms
+All runs: 11121, 10855, 10286ms

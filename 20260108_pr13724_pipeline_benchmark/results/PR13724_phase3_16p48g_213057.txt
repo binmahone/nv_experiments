@@ -1,0 +1,7 @@
+JAR: /home/hongbin/experiments/20260108_pr13724_pipeline_benchmark/jars/rapids-4-spark_2.12-phase3.jar
+Config: 16 parallelism + 48GB shuffle
+Parallelism: 16
+Average time: 38531ms
+Min time: 37030ms
+Max time: 39335ms
+All runs: 39335, 37030, 39230ms

@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+classes/
+cpp/build/
+
+# Libraries and dependencies
+arrow_libs/
+jars/
+lib/
+
+# Generated charts
+*.png
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+*.iml
+.vscode/
