@@ -7,6 +7,15 @@ Spark Rapids Executor to accelerate Python UDF execution by eliminating cross-pr
 serialization overhead. Experiments show that this approach can achieve **3% - 34%** 
 performance improvement, depending on the computational complexity of the UDF.
 
+### Inspiration
+
+This approach is inspired by **DuckDB's embedded Python mechanism**. DuckDB successfully 
+embeds Python within its process using pybind11, enabling seamless Python UDF execution 
+without inter-process communication overhead. We adapt this pattern for the Spark Rapids 
+ecosystem to bring similar benefits to Spark users.
+
+Reference: [DuckDB Python API](https://duckdb.org/docs/api/python/overview)
+
 ---
 
 ## 1. Background and Problem
@@ -51,10 +60,11 @@ and eliminate serialization overhead.
 +---------------------------------------------------------------------+
 |                         JVM Executor                                |
 |  +-------------+  Direct memory   +-----------------------------+   |
-|  |   Spark     | <--------------> |   Embedded Python (JEP)     |   |
-|  |   Task      |    Zero-copy     |  +---------------------+    |   |
-|  |             |                  |  |   User UDF          |    |   |
-|  +-------------+                  |  |   (pandas/numpy)    |    |   |
+|  |   Spark     | <--------------> |   Embedded Python           |   |
+|  |   Task      |    Zero-copy     |   (pybind11 + JNI)          |   |
+|  |             |                  |  +---------------------+    |   |
+|  +-------------+                  |  |   User UDF          |    |   |
+|                                   |  |   (pandas/numpy)    |    |   |
 |                                   |  +---------------------+    |   |
 |                                   +-----------------------------+   |
 +---------------------------------------------------------------------+
@@ -65,15 +75,40 @@ and eliminate serialization overhead.
 
 ### 2.2 Technical Implementation
 
-Using the **JEP (Java Embedded Python)** library:
+Using **pybind11** (C++ Python binding) + **JNI** (Java Native Interface):
 
-```java
-// Java side
-try (Interpreter interp = new SharedInterpreter()) {
-    // Direct data transfer, no serialization
-    interp.set("input_data", dataArray);
-    interp.exec(userUdfCode);
-    Object result = interp.getValue("output_data");
+```
+Call Chain:
++----------+      +----------------+      +-------------+      +----------+
+|   Java   | ---> |  JNI Bridge    | ---> |  pybind11   | ---> |  CPython |
+|  (Spark) |      |  (native .so)  |      |  (C++ code) |      |          |
++----------+      +----------------+      +-------------+      +----------+
+                         ^
+                         |
+              RAPIDS ships this (multi-version)
+```
+
+```cpp
+// C++ bridge code using pybind11
+#include <pybind11/embed.h>
+#include <jni.h>
+namespace py = pybind11;
+
+extern "C" JNIEXPORT jobject JNICALL
+Java_com_nvidia_spark_rapids_EmbeddedPython_execute(
+    JNIEnv *env, jobject obj, jstring udf_code, jobject data) {
+    
+    py::scoped_interpreter guard{};
+    
+    // Direct memory access, no serialization
+    py::object pandas = py::module_::import("pandas");
+    py::object np = py::module_::import("numpy");
+    
+    // Execute user UDF
+    py::exec(udf_code_str);
+    
+    // Return result directly
+    return convert_to_java(result);
 }
 ```
 
@@ -197,73 +232,205 @@ def run_cross_mode(func, data, batch_size):
 
 ## 5. Environment Requirements
 
-### 5.1 Required Dependencies
+### 5.1 What RAPIDS Ships vs User Requirements
 
-| Dependency | Description | Can RAPIDS Distribute? |
-|------------|-------------|------------------------|
-| **libpython3.x.so** | CPython shared library | No - must use user's system |
-| **JEP (libjep.so)** | Java-Python bridge library | Partial - needs multi-version support |
-| **numpy/pandas** | User UDF dependencies | No - user must install |
+| Component | Shipped by RAPIDS? | User Action Required |
+|-----------|-------------------|---------------------|
+| **pybind11 bridge (.so)** | YES (multi-version) | None |
+| **libpython3.x.so** | NO | Must have Shared Python |
+| **numpy/pandas** | NO | User installs as needed |
 
-### 5.2 User Environment Requirements
+**Key Benefit**: User does NOT need to `pip install` any extra bridge library.
+RAPIDS ships pre-compiled native libraries for Python 3.8 - 3.12.
 
-```bash
-# 1. Python must be compiled as shared library
-python3 -c "import sysconfig; print(sysconfig.get_config_var('Py_ENABLE_SHARED'))"
-# Output should be 1
+### 5.2 Shared Python Requirement
 
-# 2. Install JEP
-pip install jep
+Embedded Python requires **Shared Python** (Python compiled with `--enable-shared`).
 
-# 3. Set environment variables
-export LD_LIBRARY_PATH=/path/to/libpython:$LD_LIBRARY_PATH
+#### What is Shared Python?
+
+```
+Static Python (won't work):
++---------------------------+
+|  python3 executable       |
+|  (all code compiled in)   |
+|  Cannot be embedded!      |
++---------------------------+
+
+Shared Python (required):
++------------------+     +------------------------+
+| python3 (loader) | --> | libpython3.10.so       |
++------------------+     | (shared library)       |
+                         | Can be linked by       |
+                         | other programs (JVM)   |
+                         +------------------------+
 ```
 
-### 5.3 Spark Configuration
+### 5.3 Python Installation Methods - Shared by Default?
+
+| Installation Method | Shared by Default? | Notes |
+|--------------------|-------------------|-------|
+| **Ubuntu/Debian apt** | YES | `apt install python3` |
+| **CentOS/RHEL yum** | YES | `yum install python3` |
+| **Fedora dnf** | YES | `dnf install python3` |
+| **macOS Homebrew** | YES | `brew install python` |
+| **Windows Official** | YES | python.org installer |
+| **macOS Official** | YES | python.org installer |
+| **Docker python image** | YES | `python:3.10` |
+| **Conda / Miniconda** | **NO** | Default is static! |
+| **pyenv** | **NO** | Default is static! |
+| **Source compilation** | **NO** | Need `--enable-shared` |
+
+### 5.4 How to Check Your Python
+
+```bash
+# Check if your Python is shared
+python3 -c "import sysconfig; print('Shared:', sysconfig.get_config_var('Py_ENABLE_SHARED'))"
+
+# Output:
+#   1 = Shared (OK)
+#   0 = Static (Need to fix)
+```
+
+### 5.5 Fixing Static Python Installations
+
+#### For Conda Users (Common!)
+
+```bash
+# Option 1: Use conda-forge channel (recommended)
+conda create -n spark-env -c conda-forge python=3.10 numpy pandas
+conda activate spark-env
+
+# Verify
+python -c "import sysconfig; print(sysconfig.get_config_var('Py_ENABLE_SHARED'))"
+# Should output: 1
+```
+
+#### For pyenv Users
+
+```bash
+# Install with --enable-shared flag
+env PYTHON_CONFIGURE_OPTS="--enable-shared" pyenv install 3.10.0
+
+# Or set permanently in ~/.bashrc
+echo 'export PYTHON_CONFIGURE_OPTS="--enable-shared"' >> ~/.bashrc
+source ~/.bashrc
+pyenv install 3.10.0
+```
+
+#### For Source Compilation
+
+```bash
+./configure --enable-shared --prefix=/usr/local
+make -j$(nproc)
+sudo make install
+
+# Verify libpython exists
+ls -la /usr/local/lib/libpython3.10.so*
+```
+
+### 5.6 Spark Configuration
 
 ```properties
 # Enable embedded mode
 spark.rapids.python.embedded.enabled=true
 
-# JEP library path
-spark.executor.extraJavaOptions=-Djava.library.path=/path/to/jep
+# RAPIDS auto-detects Python version and loads correct .so
+# No manual configuration needed!
 
-# Environment variable propagation
+# Environment variable for libpython path (if non-standard location)
 spark.executorEnv.LD_LIBRARY_PATH=/usr/lib/python3.10/config-3.10-x86_64-linux-gnu
 ```
 
-### 5.4 Intrusiveness Assessment
+### 5.7 Intrusiveness Assessment
 
 | Aspect | Impact Level | Description |
 |--------|--------------|-------------|
-| Python Version | Medium | Requires shared library version |
-| Extra Dependencies | Low | Only need `pip install jep` |
-| Environment Variables | Medium | Need to configure LD_LIBRARY_PATH |
+| Extra pip install | **None** | RAPIDS ships the bridge |
+| Python Version | Medium | Must be Shared Python |
+| Environment Variables | Low | Usually auto-detected |
 | User Code | **None** | UDF code requires no modification |
 | Isolation | High Risk | Python crash may crash JVM |
 
-### 5.5 Compatibility Matrix
+### 5.8 User Environment Summary
 
-| Python Version | Support Status |
-|----------------|----------------|
-| 3.8 | Supported |
-| 3.9 | Supported |
-| 3.10 | Supported |
-| 3.11 | Supported |
-| 3.12 | Supported |
+```
++------------------------------------------------------------------+
+|                    User Environment Checklist                     |
++------------------------------------------------------------------+
+|                                                                  |
+|  [ ] Shared Python installed                                     |
+|      - Linux system Python: Usually OK                           |
+|      - Conda: Use conda-forge channel                            |
+|      - pyenv: Use --enable-shared                                |
+|                                                                  |
+|  [ ] Python libraries installed (numpy, pandas, etc.)            |
+|      - Same as current requirements                              |
+|                                                                  |
+|  [ ] NO additional pip install needed!                           |
+|      - RAPIDS ships pybind11 bridge for Python 3.8-3.12          |
+|                                                                  |
++------------------------------------------------------------------+
+```
 
 ---
 
-## 6. Risks and Mitigation
+## 6. Distribution Strategy
+
+### 6.1 Multi-Version Native Library Distribution
+
+RAPIDS will ship pre-compiled native libraries for all supported Python versions:
+
+```
+rapids-plugin.jar (or separate native package)
+├── native/
+│   ├── linux-x86_64/
+│   │   ├── py38/
+│   │   │   └── rapids_python_bridge.so
+│   │   ├── py39/
+│   │   │   └── rapids_python_bridge.so
+│   │   ├── py310/
+│   │   │   └── rapids_python_bridge.so
+│   │   ├── py311/
+│   │   │   └── rapids_python_bridge.so
+│   │   └── py312/
+│   │       └── rapids_python_bridge.so
+│   └── linux-aarch64/
+│       └── ... (ARM versions)
+```
+
+### 6.2 Runtime Version Detection
+
+```java
+// RAPIDS automatically detects Python version at runtime
+public class EmbeddedPythonLoader {
+    public static void load() {
+        String pyVersion = detectPythonVersion();  // e.g., "3.10"
+        String arch = System.getProperty("os.arch");  // e.g., "amd64"
+        
+        String soPath = String.format(
+            "native/linux-%s/py%s/rapids_python_bridge.so",
+            arch.equals("amd64") ? "x86_64" : arch,
+            pyVersion.replace(".", "")
+        );
+        
+        System.load(extractToTemp(soPath));
+    }
+}
+```
+
+---
+
+## 7. Risks and Mitigation
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | GIL Limitation | Python concurrency limited within single executor | Control concurrent Python task count |
 | Memory Leaks | Unreleased Python objects affect JVM | Periodically restart interpreter |
 | Stability | Python exceptions may affect JVM | Exception isolation, fallback mechanism |
-| Version Compatibility | JEP must match Python version | Runtime detection, multi-version distribution |
+| Version Mismatch | Bridge .so must match Python version | Runtime detection, multi-version distribution |
 
-### 6.1 Fallback Mechanism
+### 7.1 Fallback Mechanism
 
 ```java
 try {
@@ -277,9 +444,9 @@ try {
 
 ---
 
-## 7. Conclusions and Recommendations
+## 8. Conclusions and Recommendations
 
-### 7.1 Performance Benefit Summary
+### 8.1 Performance Benefit Summary
 
 | Scenario | Expected Speedup | Typical UDFs |
 |----------|------------------|--------------|
@@ -287,7 +454,71 @@ try {
 | Medium Complexity UDF | **5-10%** | Regex extraction, URL parsing |
 | Compute Intensive UDF | **1-5%** | PII masking, complex validation |
 
-### 7.2 Applicable Scenarios
+### 8.2 Beyond Performance: Architectural Benefits
+
+While performance gains may be modest for compute-intensive UDFs (1-5%), committing to the 
+embedded Python architecture brings significant **non-performance benefits**:
+
+#### Simplified Deployment Architecture
+
+| Aspect | Cross-Process (Current) | Embedded (Proposed) |
+|--------|------------------------|---------------------|
+| Process management | JVM + Python workers | Single JVM process |
+| Resource coordination | Complex IPC | In-process |
+| Failure modes | Multiple process crashes | Single process |
+| Debugging | Multi-process tracing | Single process debugging |
+
+#### Simplified RAPIDS Internal Logic
+
+The current cross-process architecture creates complexity in RAPIDS code:
+
+1. **OOM State Machine**: Current implementation must handle OOM conditions across 
+   process boundaries (JVM heap vs Python process memory). With embedded Python, 
+   memory management is unified within a single process.
+
+2. **Task Thread Blocking Detection**: Determining whether a Spark task thread is 
+   blocked waiting for Python worker response is complex with IPC. With embedded 
+   execution, thread state is directly observable within the JVM.
+
+3. **Resource Semaphore Logic**: `PythonWorkerSemaphore` coordinates GPU access 
+   across multiple Python worker processes. Embedded mode simplifies this to 
+   in-process thread synchronization.
+
+```
+Current (Cross-Process):
++------------------+          +------------------+
+|   JVM Executor   |   IPC    |  Python Worker   |
+|  +------------+  | <------> |  +------------+  |
+|  | OOM State  |  |          |  | OOM State  |  |
+|  | Machine    |  |          |  | (separate) |  |
+|  +------------+  |          |  +------------+  |
+|  | Is thread  |  |  ???     |                  |
+|  | blocked?   |  | -------> |  (hard to know)  |
++------------------+          +------------------+
+
+Embedded (Proposed):
++------------------------------------------+
+|              JVM Executor                |
+|  +----------------+  +----------------+  |
+|  | OOM State      |  | Embedded Py    |  |
+|  | Machine        |  | (same process) |  |
+|  | (unified)      |  +----------------+  |
+|  +----------------+                      |
+|  | Thread state: directly observable    |
++------------------------------------------+
+```
+
+#### Summary of Architectural Benefits
+
+| Benefit | Impact |
+|---------|--------|
+| Single process deployment | Easier ops, monitoring |
+| Unified memory management | Simpler OOM handling |
+| Direct thread observability | Easier blocking detection |
+| No IPC coordination | Simpler semaphore logic |
+| Fewer failure modes | More robust system |
+
+### 8.3 Applicable Scenarios
 
 **Recommended for Embedded Mode**:
 - Lightweight UDFs (computation < serialization)
@@ -297,9 +528,17 @@ try {
 
 **Continue Using Cross-Process Mode**:
 - Compute intensive UDFs (limited benefit)
-- Restricted environments (cannot install JEP)
+- Environments with Static Python that cannot be changed
 - Scenarios requiring extreme stability
 
+### 8.4 User Experience Comparison
+
+| Aspect | Current (Cross-Process) | Embedded (pybind11) |
+|--------|------------------------|---------------------|
+| Extra pip install | None | **None** |
+| Python requirement | Any Python | Shared Python |
+| UDF code changes | None | **None** |
+| Performance | Baseline | **3-34% faster** |
 
 ---
 
@@ -313,25 +552,72 @@ See `embed_vs_cross_final.py`
 
 ```bash
 #!/bin/bash
-echo "=== Checking Embedded Python Environment ==="
+echo "========================================"
+echo "Embedded Python Environment Check"
+echo "========================================"
 
-# Python shared library
+# 1. Python version
+echo -e "\n[1] Python Version:"
+python3 --version
+
+# 2. Shared library check
+echo -e "\n[2] Shared Python Check:"
 SHARED=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('Py_ENABLE_SHARED'))")
 if [ "$SHARED" = "1" ]; then
-    echo "OK: Python shared library: enabled"
+    echo "    OK: Python is compiled as shared library"
 else
-    echo "ERROR: Python shared library: disabled (required)"
+    echo "    ERROR: Python is static build!"
+    echo "    Fix: "
+    echo "      - Conda users: conda install -c conda-forge python"
+    echo "      - pyenv users: PYTHON_CONFIGURE_OPTS='--enable-shared' pyenv install <version>"
 fi
 
-# JEP
-python3 -c "import jep" 2>/dev/null && echo "OK: JEP: installed" || echo "ERROR: JEP: not installed (pip install jep)"
+# 3. libpython location
+echo -e "\n[3] libpython Location:"
+LIBDIR=$(python3 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+ls -la $LIBDIR/libpython3*.so* 2>/dev/null || echo "    Not found in $LIBDIR (may need LD_LIBRARY_PATH)"
 
-# numpy/pandas
-python3 -c "import numpy, pandas" 2>/dev/null && echo "OK: numpy/pandas: installed" || echo "ERROR: numpy/pandas: missing"
+# 4. Required Python packages
+echo -e "\n[4] Python Packages:"
+python3 -c "import numpy; print('    numpy:', numpy.__version__)" 2>/dev/null || echo "    numpy: NOT INSTALLED"
+python3 -c "import pandas; print('    pandas:', pandas.__version__)" 2>/dev/null || echo "    pandas: NOT INSTALLED"
+
+echo -e "\n========================================"
+echo "Check complete!"
+echo "========================================"
 ```
 
-### C. References
+### C. Conda Environment Setup
 
-- [JEP GitHub](https://github.com/ninia/jep)
+```yaml
+# environment.yml for RAPIDS with Embedded Python support
+name: rapids-spark
+channels:
+  - conda-forge
+  - rapidsai
+  - nvidia
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - pyarrow
+  - rapids=24.02
+```
+
+```bash
+# Create environment
+conda env create -f environment.yml
+conda activate rapids-spark
+
+# Verify shared Python
+python -c "import sysconfig; print('Shared:', sysconfig.get_config_var('Py_ENABLE_SHARED'))"
+# Output should be: Shared: 1
+```
+
+### D. References
+
+- [pybind11 Documentation](https://pybind11.readthedocs.io/)
+- [pybind11 Embedding Python](https://pybind11.readthedocs.io/en/stable/advanced/embedding.html)
 - [Apache Arrow IPC](https://arrow.apache.org/docs/format/IPC.html)
 - [Spark Python UDF Documentation](https://spark.apache.org/docs/latest/api/python/user_guide/sql/arrow_pandas.html)
+- [Python Shared Library](https://docs.python.org/3/extending/embedding.html)
