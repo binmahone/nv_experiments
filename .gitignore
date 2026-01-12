@@ -1,0 +1,37 @@
+# Compiled JAR artifacts
+*.jar
+
+# Test data files
+*.parquet
+data/
+
+# Spark output markers
+_SUCCESS
+
+# Checksum files
+*.crc
+
+# Log files from benchmark runs
+*.log
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+*.iml
+.vscode/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Build output
+target/
